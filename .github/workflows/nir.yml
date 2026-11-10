@@ -1,0 +1,164 @@
+name: Mesa NIR
+
+# Builds the Mesa NIR static libraries and headers that the Orblit Direct3D 12 backend links.
+# The Mesa source is the submodule at nir/mesa. Each variant uploads one artifact.
+
+on:
+  push:
+    paths:
+      - nir/**
+      - .github/workflows/nir.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: windows-2022
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: MinGW/LLVM x86_64
+            variant: x86_64-llvm
+            library: libNIR.windows.x86_64.a
+            flags: use_mingw=yes arch=x86_64 use_llvm=yes mingw_prefix=$HOME/llvm-mingw
+            mingw_version: 20251118/llvm-mingw-20251118-ucrt-x86_64
+            llvm: yes
+
+          - name: MinGW/LLVM x86_32
+            variant: x86_32-llvm
+            library: libNIR.windows.x86_32.a
+            flags: use_mingw=yes arch=x86_32 use_llvm=yes mingw_prefix=$HOME/llvm-mingw
+            mingw_version: 20251118/llvm-mingw-20251118-ucrt-x86_64
+            llvm: yes
+
+          - name: MinGW/LLVM arm64
+            variant: arm64-llvm
+            library: libNIR.windows.arm64.a
+            flags: use_mingw=yes arch=arm64 use_llvm=yes mingw_prefix=$HOME/llvm-mingw
+            mingw_version: 20251118/llvm-mingw-20251118-ucrt-x86_64
+            llvm: yes
+
+          - name: MSVC x86_64
+            variant: x86_64-msvc
+            library: libNIR.windows.x86_64.lib
+            flags: use_mingw=no arch=x86_64
+
+          - name: MSVC x86_32
+            variant: x86_32-msvc
+            library: libNIR.windows.x86_32.lib
+            flags: use_mingw=no arch=x86_32
+
+          - name: MSVC arm64
+            variant: arm64-msvc
+            library: libNIR.windows.arm64.lib
+            flags: use_mingw=no arch=arm64
+
+          - name: MinGW/GCC x86_64
+            variant: x86_64-gcc
+            library: libNIR.windows.x86_64.a
+            flags: use_mingw=yes arch=x86_64 mingw_prefix=$HOME/gcc-mingw
+            mingw_version: 15.2.0posix-14.0.0-msvcrt-r7/winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64msvcrt-14.0.0-r7
+            mingw: yes
+
+          - name: MinGW/GCC x86_32
+            variant: x86_32-gcc
+            library: libNIR.windows.x86_32.a
+            flags: use_mingw=yes arch=x86_32 mingw_prefix=$HOME/gcc-mingw
+            mingw_version: 15.2.0posix-14.0.0-msvcrt-r7/winlibs-i686-posix-dwarf-gcc-15.2.0-mingw-w64msvcrt-14.0.0-r7
+            mingw: yes
+
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Install the Python packages
+        run: python -m pip install scons==4.9.0 mako pyyaml
+
+      - name: Set up MinGW/LLVM
+        if: ${{ matrix.llvm == 'yes' }}
+        run: |
+          curl -L -O https://github.com/mstorsjo/llvm-mingw/releases/download/${{matrix.mingw_version}}.zip
+          unzip -q llvm-mingw-*.zip
+          rm llvm-mingw-*.zip
+          mv llvm-mingw-* "$HOME/llvm-mingw"
+          echo "$HOME/llvm-mingw/bin" >> $GITHUB_PATH
+
+      - name: Set up MinGW/GCC
+        if: ${{ matrix.mingw == 'yes' }}
+        run: |
+          curl -L -O https://github.com/brechtsanders/winlibs_mingw/releases/download/${{matrix.mingw_version}}.zip
+          unzip -q winlibs-*.zip
+          rm winlibs-*.zip
+          mv mingw* "$HOME/gcc-mingw"
+          echo "$HOME/gcc-mingw/bin" >> $GITHUB_PATH
+
+      # git apply reads the patch paths from the repository root, so the build folder is its own repository.
+      - name: Prepare the Mesa source
+        shell: bash
+        working-directory: nir
+        run: |
+          git init -q .
+          ./update_mesa.sh
+
+      - name: Build
+        working-directory: nir
+        run: scons platform=windows ${{ matrix.flags }} optimize=speed
+
+      - name: Upload the artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: nir-${{ matrix.variant }}-release
+          path: |
+            nir/bin/${{ matrix.library }}
+            nir/orblit-mesa/VERSION.info
+            nir/orblit-mesa/**/*.h
+            nir/orblit-mesa/**/*.hpp
+          if-no-files-found: error
+
+      # The engine imports the allocators under the Orblit names, so the library must reference them.
+      - name: Check the allocator names
+        shell: bash
+        run: grep -a -q orblit_nir_malloc nir/bin/${{ matrix.library }}
+
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/nir-')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download the artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Zip the artifacts
+        working-directory: artifacts
+        run: |
+          for dir in */; do
+            (cd "${dir%/}" && zip -q -r "../${dir%/}.zip" .)
+          done
+
+      # This job has no checkout, so gh needs the repository named.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" artifacts/*.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Mesa NIR ${GITHUB_REF_NAME#nir-}" \
+            --notes "Mesa NIR static libraries and headers for the Orblit Direct3D 12 backend."

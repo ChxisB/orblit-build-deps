@@ -1,0 +1,3 @@
+[submodule "nir/mesa"]
+	path = nir/mesa
+	url = https://gitlab.freedesktop.org/mesa/mesa
